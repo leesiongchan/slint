@@ -1426,6 +1426,14 @@ impl WinitWindowAdapter {
 
                 self.dispatch_internal_event(event);
             }
+            WinitWindowEvent::Ime(winit::event::Ime::CompositionStatusChanged { context_id, status }) => {
+                use winit::event::CompositionStatus as Native;
+                use i_slint_core::input::CompositionStatus as Core;
+                self.dispatch_internal_event(i_slint_core::platform::InternalEvent::CompositionStatusChanged {
+                    context_id,
+                    status: match status { Native::Unknown => Core::Unknown, Native::Idle => Core::Idle, Native::Active => Core::Active },
+                });
+            }
             WinitWindowEvent::Ime(winit::event::Ime::Preedit(string, preedit_selection)) => {
                 let event = InternalKeyEvent {
                     event_type: KeyEventType::UpdateComposition,

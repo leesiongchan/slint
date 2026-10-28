@@ -1049,6 +1049,8 @@ fn build(l: &mut Loader) {
     } }
 
     item! { ComplexText: SimpleText {
+        /// Literal UTF-8 source decoration ranges; empty leaves native Text unchanged.
+        in property <[TextInputDecoration]> text-decorations;
         /// The name of the font family selected for rendering the text.
         ///
         /// ```slint 'font-family: "Comic Sans MS";' imageAlt="text font-family" width="200" height="200" needsBackground
@@ -2244,6 +2246,17 @@ fn build(l: &mut Loader) {
     }
 
     item! { TextInput {
+        /// Retain directed source selection when keyboard focus moves to other controls.
+        in property <bool> preserve-selection-on-focus-loss: false;
+        /// A primary click on a visible source checkbox, in committed UTF-8 offsets.
+        callback marker-activated(start: int, end: int);
+        /// True only when the native context explicitly permits source commands.
+        out property <bool> source-edits-allowed;
+        /// Experimental source markers. Invalid or fragmented ranges remain raw source.
+        in property <[TextInputMarker]> text-markers;
+        /// Experimental source decorations. Sorted non-overlapping UTF-8 byte ranges.
+        /// Empty by default; this property never modifies text or undo history.
+        in property <[TextInputDecoration]> text-decorations;
         /// The text rendered and editable by the user.
         /// \default ""
         in-out property <string> text;
@@ -2330,6 +2343,8 @@ fn build(l: &mut Loader) {
         /// so `focus` may precede `anchor` to select backwards.
         /// Pass the same value for both to place the text cursor at that offset without selecting anything.
         function set-selection-offsets(anchor: int, focus: int) { BuiltinFunction.SetSelectionOffsets }
+        /// One validated source replacement with directed undo/redo selection.
+        function apply-source-edit(start: int, end: int, replacement: string, anchor: int, caret: int) -> bool { BuiltinFunction.ApplySourceEdit }
         /// Selects all text.
         function select-all() { }
         /// Clears the selection.

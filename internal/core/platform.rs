@@ -576,6 +576,8 @@ impl core::fmt::Debug for InternalEventBox {
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum InternalEvent {
+    /// Authoritative native context lifecycle; stale context IDs cannot unlock edits.
+    CompositionStatusChanged { context_id: u64, status: crate::input::CompositionStatus },
     /// A pointer event, including the ones that have no public representation, such as gestures.
     Mouse(crate::input::BackendMouseEvent),
     /// A key event, including input method composition updates.
@@ -657,7 +659,7 @@ impl InternalEvent {
             }
             // There's no public touch event, and the pointer events the runtime synthesizes from
             // a touch point carry a finger id that `WindowEvent` can't express.
-            Self::Touch { .. } => None,
+            Self::Touch { .. } | Self::CompositionStatusChanged { .. } => None,
         }
     }
 
@@ -667,7 +669,7 @@ impl InternalEvent {
             Self::Mouse(event) => crate::input::MouseEvent::from(*event)
                 .position()
                 .map(crate::lengths::logical_position_to_api),
-            Self::Key(_) => None,
+            Self::Key(_) | Self::CompositionStatusChanged { .. } => None,
             Self::Touch { position, .. } => {
                 Some(crate::lengths::logical_position_to_api(*position))
             }

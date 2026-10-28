@@ -4879,6 +4879,20 @@ fn compile_builtin_function_call(
                 }
             })
         }
+        BuiltinFunction::ApplySourceEdit => {
+            if let [llr::Expression::PropertyReference(pr), start, end, replacement, anchor, caret] = arguments {
+                let window = access_window_adapter_field(ctx);
+                let start = compile_expression(start, ctx);
+                let end = compile_expression(end, ctx);
+                let replacement = compile_expression(replacement, ctx);
+                let anchor = compile_expression(anchor, ctx);
+                let caret = compile_expression(caret, ctx);
+                item_owner(pr).then(|owner| {
+                    let (item, item_rc) = native_item_from_owner(pr, ctx, &owner);
+                    quote!(#item.apply_source_edit(#window, &#item_rc, #start as i32, #end as i32, #replacement, #anchor as i32, #caret as i32))
+                })
+            } else { panic!("internal error: invalid source edit arguments {arguments:?}") }
+        }
         BuiltinFunction::SetSelectionOffsets => {
             if let [llr::Expression::PropertyReference(pr), anchor_expr, focus_expr] = arguments {
                 let window_adapter_tokens = access_window_adapter_field(ctx);

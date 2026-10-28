@@ -5,6 +5,7 @@
 //! capsules, and the clip-based recoloring of selected glyphs.
 
 use super::layout::ElisionCut;
+use super::markers::MarkerRendering;
 use super::selection::{RunCoverage, SelectionSpan, run_coverage};
 use super::shaping::{Brush, TextParagraph};
 use super::*;
@@ -108,6 +109,7 @@ impl TextParagraph {
         default_stroke_brush: &Option<<R as GlyphRenderer>::PlatformBrush>,
         default_text_color: Color,
         selection: Option<&SelectionRendering<'_, R>>,
+        markers: &[MarkerRendering],
     ) {
         let para_y = layout.y_offset + self.y;
 
@@ -177,6 +179,10 @@ impl TextParagraph {
             let vertically_truncated = last_line && vertical_truncation;
             let line_spans =
                 selection.map(|selection| selection.spans.for_line(paragraph_index, index));
+            let mut hidden_ranges = markers.iter()
+                .flat_map(|marker| marker.spans.for_line(paragraph_index, index))
+                .map(SelectionSpan::x).collect::<Vec<_>>();
+            hidden_ranges.sort_by(|a, b| a.start.total_cmp(&b.start));
             // Padded for ink overhanging the advance, like the vertical filtering of lines.
             let padded_x_range = visible_x_range
                 .map(|x_range| (x_range.start - line_height)..(x_range.end + line_height));
@@ -212,6 +218,7 @@ impl TextParagraph {
                                 &mut truncated_glyphs.into_iter(),
                                 selection.map(|selection| &selection.foreground),
                                 line_spans.unwrap_or_default(),
+                                &hidden_ranges,
                             );
                             ellipsis
                         } else {
@@ -225,6 +232,7 @@ impl TextParagraph {
                                 &mut glyph_run.positioned_glyphs(),
                                 selection.map(|selection| &selection.foreground),
                                 line_spans.unwrap_or_default(),
+                                &hidden_ranges,
                             );
                             None
                         };
@@ -382,8 +390,47 @@ impl TextParagraph {
         // there is no selection, which `run_coverage` reports as `Unselected`.
         selection_brush: Option<&<R as GlyphRenderer>::PlatformBrush>,
         line_spans: &[SelectionSpan],
+        hidden_ranges: &[Range<f32>],
     ) {
         let run_x = glyph_run.offset()..glyph_run.offset() + glyph_run.advance();
+
+        if hidden_ranges.iter().any(|range| range.start < run_x.end && range.end > run_x.start) {
+            let glyphs = glyphs_it.collect::<Vec<_>>();
+            let original_x = item_renderer.get_current_clip().x_length_range();
+            let scale = item_renderer.scale_factor();
+            let clip_x = (original_x.start * scale).get()..(original_x.end * scale).get();
+            let mut draw_visible = |x: Range<f32>| {
+                if x.end <= x.start { return; }
+                item_renderer.save_state();
+                let scale = item_renderer.scale_factor();
+                let clip = item_renderer.get_current_clip();
+                let render = item_renderer.combine_clip(
+                    LogicalRect::new(
+                        LogicalPoint::from_lengths(PhysicalLength::new(x.start) / scale, clip.origin.y_length()),
+                        LogicalSize::from_lengths(PhysicalLength::new(x.end - x.start) / scale, clip.height_length()),
+                    ),
+                    LogicalBorderRadius::zero(),
+                );
+                if render {
+                    Self::draw_glyph_run_with_selection(
+                        glyph_run, item_renderer, default_fill_brush, default_stroke_brush,
+                        para_y, visible_x_range, &mut glyphs.iter().cloned(),
+                        selection_brush, line_spans, &[],
+                    );
+                }
+                item_renderer.restore_state();
+            };
+            let mut x = clip_x.start;
+            for range in hidden_ranges {
+                if range.end <= x { continue; }
+                let start = range.start.max(x).min(clip_x.end);
+                draw_visible(x..start);
+                x = range.end.max(x).min(clip_x.end);
+                if x >= clip_x.end { break; }
+            }
+            draw_visible(x..clip_x.end);
+            return;
+        }
 
         // Bidirectional text reorders glyphs within a run, so this filters rather than truncating.
         let x_range = visible_x_range.cloned();
@@ -660,6 +707,7 @@ impl Layout {
         default_stroke_brush: Option<<R as GlyphRenderer>::PlatformBrush>,
         default_text_color: Color,
         selection: Option<&SelectionRendering<'_, R>>,
+        markers: &[MarkerRendering],
     ) {
         // Compute the cut once: explicit `\n` breaks produce one paragraph each, but they must
         // elide as a single block (drop lines below the box, ellipsis on the last visible one).
@@ -701,6 +749,7 @@ impl Layout {
                 &default_stroke_brush,
                 default_text_color,
                 selection,
+                markers,
             );
         }
     }

@@ -52,6 +52,45 @@ macro_rules! builtin_struct_field_default_tokens {
 macro_rules! for_each_builtin_structs {
     ($macro:ident) => {
         $macro! {
+            /// Vector replacement over unchanged source, with optional compact spacing.
+            /// Raw source is shown while the cursor, selection, or composition touches the range.
+            #[non_exhaustive]
+            pub struct TextInputMarker {
+                /// First UTF-8 source byte, inclusive.
+                start: i32,
+                /// First UTF-8 source byte after the range.
+                end: i32,
+                /// Vector shape drawn inside the source range.
+                kind: TextInputMarkerKind,
+                /// Marker foreground; transparent colors leave the source visible.
+                foreground: Color,
+                /// Use a compact two-em slot while the marker is painted.
+                compact: bool,
+            }
+
+            /// Combined styling over unchanged TextInput source.
+            /// Ranges are half-open UTF-8 byte offsets. Invalid, empty, overlapping,
+            /// or unsorted ranges are ignored. The composition keeps its base style.
+            #[non_exhaustive]
+            pub struct TextInputDecoration {
+                /// First source byte in the range.
+                start: i32,
+                /// First source byte after the range.
+                end: i32,
+                /// Foreground color, overridden by selected-text foreground.
+                foreground: Color,
+                /// Render the range in bold; false preserves the input's base weight.
+                bold: bool,
+                /// Render the range in italics.
+                italic: bool,
+                /// Draw a line through the range.
+                strikethrough: bool,
+                /// Underline the range without making it interactive.
+                underline: bool,
+                /// Monospace code with a subtle background, retaining the base font size.
+                code: bool,
+            }
+
             /// The `KeyboardModifiers` struct provides booleans to indicate possible modifier keys on a keyboard, such as Shift, Control, etc.
             /// It is provided as part of `KeyEvent`'s `modifiers` field.
             ///

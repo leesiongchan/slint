@@ -9,6 +9,8 @@ pub enum Style {
     Strong,
     Strikethrough,
     Code,
+    SourceCode,
+    CompactMarker { max_width: f32 },
     Link,
     Underline,
     // ARGB encoded

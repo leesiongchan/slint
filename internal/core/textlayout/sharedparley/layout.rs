@@ -393,10 +393,10 @@ impl Layout {
         match self.max_physical_height {
             Some(max_physical_height) if self.elision_info.is_some() => {
                 let para_y = self.y_offset + paragraph.y;
-                // `line_fits_height` rounds the bottom up by a pixel; allow the same slack at the
-                // top so a line sitting right on the box edge isn't dropped to a rounding error.
+                // Fallback glyphs may overhang the nominal top of the first line. Keep that
+                // line when its paragraph starts at the box edge; shifted lines still clip.
                 line_fits_height(para_y.get() + block_max, max_physical_height)
-                    && para_y.get() + block_min >= -0.5
+                    && (para_y.get() == 0.0 || para_y.get() + block_min >= -0.5)
             }
             _ => true,
         }

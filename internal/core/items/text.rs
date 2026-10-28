@@ -44,6 +44,7 @@ use unicode_segmentation::UnicodeSegmentation;
 #[derive(FieldOffsets, Default, SlintElement)]
 #[pin]
 pub struct ComplexText {
+    pub text_decorations: Property<crate::model::ModelRc<super::TextInputDecoration>>,
     pub width: Property<LogicalLength>,
     pub height: Property<LogicalLength>,
     pub text: Property<SharedString>,
@@ -180,7 +181,62 @@ impl HasFont for ComplexText {
     }
 }
 
+fn decoration_range(decoration: &super::TextInputDecoration, source: &str, previous_end: usize) -> Option<core::ops::Range<usize>> {
+            let (Ok(start), Ok(end)) =
+                (usize::try_from(decoration.start), usize::try_from(decoration.end))
+            else {
+                return None;
+            };
+            if start < previous_end
+                || start >= end
+                || end > source.len()
+                || !source.is_char_boundary(start)
+                || !source.is_char_boundary(end)
+            {
+                return None;
+            }
+            if (decoration.bold || decoration.italic || decoration.code)
+                && [start, end].into_iter().any(|offset| {
+                    unicode_segmentation::GraphemeCursor::new(offset, source.len(), true)
+                        .is_boundary(&source, 0)
+                        != Ok(true)
+                })
+            {
+                return None;
+            }
+    Some(start..end)
+}
+
+fn append_decoration(spans: &mut alloc::vec::Vec<i_slint_common::styled_text::FormattedSpan>, decoration: &super::TextInputDecoration, range: core::ops::Range<usize>) {
+    use i_slint_common::styled_text::{FormattedSpan,Style};
+    if range.is_empty() {return;}
+    for (enabled,style) in [
+        (true,Style::Color(decoration.foreground.as_argb_encoded())),
+        (decoration.bold,Style::Strong),(decoration.italic,Style::Emphasis),
+        (decoration.strikethrough,Style::Strikethrough),(decoration.underline,Style::Underline),
+        (decoration.code,Style::SourceCode),
+    ] {
+        if enabled {spans.push(FormattedSpan {range:range.clone(),style});}
+    }
+}
+
 impl RenderString for ComplexText {
+    fn text_decorations(self: Pin<&Self>) -> alloc::vec::Vec<i_slint_common::styled_text::FormattedSpan> {
+        use crate::model::Model;
+        let model=self.text_decorations();
+        model.model_tracker().track_any_change(model.row_count(),crate::InternalToken);
+        let source=self.text();
+        let mut spans=alloc::vec::Vec::new();
+        let mut previous_end=0;
+        for decoration in model.iter() {
+            if let Some(range)=decoration_range(&decoration,&source,previous_end) {
+                previous_end=range.end;
+                append_decoration(&mut spans,&decoration,range);
+            }
+        }
+        spans
+    }
+
     fn text(self: Pin<&Self>) -> PlainOrStyledText {
         PlainOrStyledText::Plain(self.text())
     }
@@ -744,6 +800,8 @@ impl PreEditSelection {
 enum UndoItemKind {
     TextInsert,
     TextRemove,
+    TextReplace(SharedString),
+    SourceEdit { removed: SharedString, anchor_after: usize, caret_after: usize },
 }
 
 #[repr(C)]
@@ -756,11 +814,31 @@ struct UndoItem {
     kind: UndoItemKind,
 }
 
+/// A source marker and its exact painted shape in item-local coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextInputMarkerHit {
+    pub source_range: core::ops::Range<usize>,
+    pub kind: super::TextInputMarkerKind,
+    pub box_rect: LogicalRect,
+}
+
+struct MarkerPress {
+    hit: TextInputMarkerHit,
+    position: LogicalPoint,
+    tracker: Pin<alloc::boxed::Box<crate::properties::PropertyTracker>>,
+    eligible: bool,
+}
+
 /// The implementation of the `TextInput` element
 #[repr(C)]
 #[derive(FieldOffsets, Default, SlintElement)]
 #[pin]
 pub struct TextInput {
+    pub marker_activated: Callback<(i32,i32)>,
+    marker_press: core::cell::RefCell<Option<MarkerPress>>,
+    pub source_edits_allowed: Property<bool>,
+    pub text_markers: Property<crate::model::ModelRc<super::TextInputMarker>>,
+    pub text_decorations: Property<crate::model::ModelRc<super::TextInputDecoration>>,
     pub text: Property<SharedString>,
     pub font_family: Property<SharedString>,
     pub font_size: Property<LogicalLength>,
@@ -785,6 +863,7 @@ pub struct TextInput {
     pub page_height: Property<LogicalLength>,
     pub cursor_visible: Property<bool>,
     pub has_focus: Property<bool>,
+    pub preserve_selection_on_focus_loss: Property<bool>,
     pub enabled: Property<bool>,
     pub accepted: Callback<VoidArg>,
     pub cursor_position_changed: Callback<PointArg>,
@@ -814,6 +893,15 @@ pub struct TextInput {
 
 impl Item for TextInput {
     fn init(self: Pin<&Self>, self_rc: &ItemRc) {
+        let weak = self_rc.downgrade();
+        self.source_edits_allowed.set_binding(move || {
+            let Some(rc) = weak.upgrade() else { return false };
+            let Some(input) = rc.downcast::<TextInput>() else { return false };
+            let input = input.as_pin_ref();
+            input.enabled() && !input.read_only() && rc.window_adapter().is_some_and(|adapter| {
+                crate::window::WindowInner::from_pub(adapter.window()).source_edits_allowed()
+            })
+        });
         // Seed the mirror so the change handler doesn't treat the initial text as external.
         self.internal_text.set(self.text());
         self.text_change_tracker.init_delayed(
@@ -903,6 +991,53 @@ impl Item for TextInput {
         self_rc: &ItemRc,
         cursor: &mut super::MouseCursorInner,
     ) -> InputEventResult {
+        let no_modifiers = || {
+            let modifiers = window_adapter.window().0.context().0.modifiers.get();
+            !modifiers.shift() && !modifiers.control() && !modifiers.alt() && !modifiers.meta()
+        };
+        // Capture and eligibility are separate: a canceled gesture still owns its release.
+        if self.marker_press.borrow().is_some() {
+            let mut pending = self.marker_press.borrow_mut();
+            let press = pending.as_mut().unwrap();
+            if press.tracker.is_dirty() || !no_modifiers() { press.eligible = false; }
+            match event {
+                MouseEvent::Released { position, button: PointerEventButton::Left, .. } => {
+                    let activate = press.eligible && self.source_edits_allowed()
+                        && window_adapter.renderer().text_input_marker_at_position(self,self_rc,*position).as_ref() == Some(&press.hit);
+                    let press = pending.take().unwrap();
+                    drop(pending);
+                    if activate {
+                        self.marker_activated.call(&(press.hit.source_range.start as i32,press.hit.source_range.end as i32));
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        self.ensure_focus_and_ime(window_adapter,self_rc);
+                    }
+                    return InputEventResult::EventAccepted;
+                }
+                MouseEvent::Moved { position, .. } if *position == press.position => (),
+                _ => press.eligible = false,
+            }
+            return InputEventResult::GrabMouse;
+        }
+        if matches!(event,MouseEvent::Pressed {button:PointerEventButton::Left,click_count:0,..})
+            && no_modifiers() && self.source_edits_allowed() {
+            let tracker = alloc::boxed::Box::pin(crate::properties::PropertyTracker::default());
+            let position = event.position().unwrap();
+            let hit = tracker.as_ref().evaluate_as_dependency_root(|| {
+                // Track whole models, including changes whose final geometry is identical.
+                use crate::model::Model;
+                let markers = self.text_markers();
+                markers.model_tracker().track_any_change(markers.row_count(),crate::InternalToken);
+                let decorations = self.text_decorations();
+                decorations.model_tracker().track_any_change(decorations.row_count(),crate::InternalToken);
+                let _ = (self.text(),self.preedit_text(),self.has_focus(),self.enabled(),self.read_only(),
+                    self.source_edits_allowed(),self.cursor_position_byte_offset(),self.anchor_position_byte_offset());
+                window_adapter.renderer().text_input_marker_at_position(self,self_rc,position)
+            });
+            if let Some(hit) = hit {
+                *self.marker_press.borrow_mut() = Some(MarkerPress {hit,position,tracker,eligible:true});
+                return InputEventResult::GrabMouse;
+            }
+        }
         if !self.enabled() {
             return InputEventResult::EventIgnored;
         }
@@ -1014,6 +1149,7 @@ impl Item for TextInput {
         window_adapter: &Rc<dyn WindowAdapter>,
         self_rc: &ItemRc,
     ) -> KeyEventResult {
+        if let Some(press) = self.marker_press.borrow_mut().as_mut() { press.eligible = false; }
         if !self.enabled() {
             return KeyEventResult::EventIgnored;
         }
@@ -1131,20 +1267,21 @@ impl Item for TextInput {
                     return KeyEventResult::EventIgnored;
                 }
 
-                self.delete_selection(window_adapter, self_rc, TextChangeNotify::SkipCallbacks);
-
+                let (insert_pos, selection_end) = self.selection_anchor_and_cursor();
                 let mut text: String = self.text().into();
-
-                // FIXME: respect grapheme boundaries
-                let insert_pos = self.selection_anchor_and_cursor().1;
-                text.insert_str(insert_pos, &event.key_event.text);
+                let kind = if insert_pos == selection_end {
+                    UndoItemKind::TextInsert
+                } else {
+                    UndoItemKind::TextReplace(text[insert_pos..selection_end].into())
+                };
+                text.replace_range(insert_pos..selection_end, &event.key_event.text);
 
                 self.add_undo_item(UndoItem {
                     pos: insert_pos,
                     text: event.key_event.text.clone(),
                     cursor: real_cursor,
                     anchor: real_anchor,
-                    kind: UndoItemKind::TextInsert,
+                    kind,
                 });
 
                 self.as_ref().set_text_internal(text.into());
@@ -1249,7 +1386,9 @@ impl Item for TextInput {
             FocusEvent::FocusOut(reason) => {
                 self.has_focus.set(false);
                 self.hide_cursor();
-                if !matches!(reason, FocusReason::WindowActivation | FocusReason::PopupActivation) {
+                if !self.preserve_selection_on_focus_loss()
+                    && !matches!(reason, FocusReason::WindowActivation | FocusReason::PopupActivation)
+                {
                     self.as_ref()
                         .anchor_position_byte_offset
                         .set(self.as_ref().cursor_position_byte_offset());
@@ -1339,7 +1478,130 @@ impl HasFont for TextInput {
     }
 }
 
+impl TextInput {
+    pub(crate) fn visual_markers(self: Pin<&Self>) -> alloc::vec::Vec<super::TextInputMarker> {
+        use crate::model::Model;
+        let model = self.text_markers();
+        model.model_tracker().track_any_change(model.row_count(), crate::InternalToken);
+        if model.row_count() == 0 || self.is_password() {
+            return alloc::vec::Vec::new();
+        }
+        let source = self.text();
+        let cursor = self.cursor_position(&source);
+        let (selection_start, selection_end) = self.selection_anchor_and_cursor();
+        let preedit = self.preedit_text();
+        let mut previous_end = 0;
+        let mut result = alloc::vec::Vec::new();
+        for mut marker in model.iter() {
+            let (Ok(start), Ok(end)) = (usize::try_from(marker.start), usize::try_from(marker.end))
+            else {
+                continue;
+            };
+            if start < previous_end
+                || start >= end
+                || end > source.len()
+                || !source.is_char_boundary(start)
+                || !source.is_char_boundary(end)
+                || [start, end].into_iter().any(|offset| {
+                    unicode_segmentation::GraphemeCursor::new(offset, source.len(), true)
+                        .is_boundary(&source, 0)
+                        != Ok(true)
+                })
+                || source[start..end].contains(['\r', '\n'])
+                || marker.foreground.alpha() == 0
+            {
+                continue;
+            }
+            previous_end = end;
+            if (start..=end).contains(&cursor) || (selection_start < end && selection_end > start) {
+                continue;
+            }
+            let shift = if !preedit.is_empty() && cursor < start { preedit.len() } else { 0 };
+            let (Ok(start), Ok(end)) = (i32::try_from(start + shift), i32::try_from(end + shift))
+            else {
+                continue;
+            };
+            marker.start = start;
+            marker.end = end;
+            result.push(marker);
+        }
+        result
+    }
+}
+
 impl RenderString for TextInput {
+    fn text_decorations(
+        self: Pin<&Self>,
+    ) -> alloc::vec::Vec<i_slint_common::styled_text::FormattedSpan> {
+        use crate::model::Model;
+        use i_slint_common::styled_text::{FormattedSpan, Style};
+
+        let model = self.text_decorations();
+        let count = model.row_count();
+        model.model_tracker().track_any_change(count, crate::InternalToken);
+        let marker_model = self.text_markers();
+        marker_model
+            .model_tracker()
+            .track_any_change(marker_model.row_count(), crate::InternalToken);
+        let markers = if marker_model.iter().any(|marker| marker.compact) {
+            self.visual_markers()
+        } else {
+            alloc::vec::Vec::new()
+        };
+        if (count == 0 && markers.is_empty()) || self.is_password() {
+            return alloc::vec::Vec::new();
+        }
+        let source = self.text();
+        let preedit = self.preedit_text();
+        // Formatting alone is cursor-independent; compact markers track reveal separately.
+        let insertion = (!preedit.is_empty()).then(|| self.cursor_position(&source));
+        let mut spans = alloc::vec::Vec::with_capacity(count);
+        let mut previous_end = 0;
+        for decoration in model.iter() {
+            let Some(range) = decoration_range(&decoration,&source,previous_end) else {continue;};
+            let (start,end) = (range.start,range.end);
+            previous_end=end;
+            let mut append = |range| append_decoration(&mut spans,&decoration,range);
+            if let Some(at) = insertion {
+                // Preedit is transient and must not inherit committed-source ranges.
+                if start < end.min(at) {
+                    append(start..end.min(at));
+                }
+                if start.max(at) < end {
+                    append(start.max(at) + preedit.len()..end + preedit.len());
+                }
+            } else {
+                append(start..end);
+            }
+        }
+        if !markers.is_empty() {
+            let visual = self.text_with_preedit().0;
+            let mut compact = alloc::vec::Vec::new();
+            for marker in markers.into_iter().filter(|marker| marker.compact) {
+                let range = marker.start as usize..marker.end as usize;
+                let prefix = &visual[range.clone()];
+                // Compact only simple list prefixes; unsupported source keeps its native layout.
+                if !prefix.ends_with(' ')
+                    || !prefix
+                        .bytes()
+                        .all(|b| matches!(b, b'-' | b'+' | b'*' | b'[' | b']' | b' ' | b'x' | b'X'))
+                {
+                    continue;
+                }
+                let next = spans.partition_point(|span| span.range.end <= range.start);
+                if spans.get(next).is_some_and(|span| span.range.start < range.end) {
+                    continue;
+                }
+                compact.push(FormattedSpan {
+                    range,
+                    style: Style::CompactMarker { max_width: self.width().get() },
+                });
+            }
+            spans.extend(compact);
+            spans.sort_by_key(|span| (span.range.start, span.range.end));
+        }
+        spans
+    }
     fn text(self: Pin<&Self>) -> PlainOrStyledText {
         // Deliberately not `visual_representation`, which would size the item off the cursor and
         // the selection too -- see `text_with_preedit`.
@@ -1940,6 +2202,44 @@ impl TextInput {
         anchor_pos != cursor_pos
     }
 
+    /// Apply one validated, nonmerging source command without external text assignment.
+    pub fn apply_source_edit(
+        self: Pin<&Self>, window_adapter: &Rc<dyn WindowAdapter>, self_rc: &ItemRc,
+        start: i32, end: i32, replacement: SharedString, anchor_after: i32, caret_after: i32,
+    ) -> bool {
+        if !self.source_edits_allowed() { return false; }
+        let (Ok(start), Ok(end), Ok(anchor_after), Ok(caret_after)) =
+            (usize::try_from(start), usize::try_from(end), usize::try_from(anchor_after), usize::try_from(caret_after))
+        else { return false };
+        let source = self.text();
+        let boundary = |text: &str, offset: usize| {
+            offset == text.len() || text.grapheme_indices(true).any(|(index, _)| index == offset)
+        };
+        if start > end || end > source.len() || !boundary(&source, start) || !boundary(&source, end) {
+            return false;
+        }
+        if source[start..end] == *replacement || (self.single_line() && replacement.contains(['\r', '\n'])) {
+            return false;
+        }
+        let mut next = String::from(source.as_str());
+        next.replace_range(start..end, &replacement);
+        if next.len() > i32::MAX as usize || !boundary(&next, anchor_after) || !boundary(&next, caret_after)
+            || !self.accept_text_input(&replacement)
+        {
+            return false;
+        }
+        self.add_undo_item(UndoItem {
+            pos: start, text: replacement,
+            cursor: self.cursor_position(&source), anchor: self.anchor_position(&source),
+            kind: UndoItemKind::SourceEdit { removed: source[start..end].into(), anchor_after, caret_after },
+        });
+        self.set_text_internal(next.into());
+        self.anchor_position_byte_offset.set(anchor_after as i32);
+        self.set_cursor_position(caret_after as i32, true, TextChangeNotify::TriggerCallbacks, window_adapter, self_rc);
+        Self::FIELD_OFFSETS.edited().apply_pin(self).call(&());
+        true
+    }
+
     fn insert(
         self: Pin<&Self>,
         text_to_insert: &str,
@@ -1955,15 +2255,19 @@ impl TextInput {
             (self.cursor_position(&text), self.anchor_position(&text))
         };
 
-        self.delete_selection(window_adapter, self_rc, TextChangeNotify::SkipCallbacks);
+        let (cursor_pos, selection_end) = self.selection_anchor_and_cursor();
         let mut text: String = self.text().into();
-        let cursor_pos = self.selection_anchor_and_cursor().1;
+        let kind = if cursor_pos == selection_end {
+            UndoItemKind::TextInsert
+        } else {
+            UndoItemKind::TextReplace(text[cursor_pos..selection_end].into())
+        };
         let mut inserted_text: SharedString = text_to_insert.into();
         if text_to_insert.contains('\n') && self.single_line() {
             inserted_text = text_to_insert.replace('\n', " ").into();
-            text.insert_str(cursor_pos, &inserted_text);
+            text.replace_range(cursor_pos..selection_end, &inserted_text);
         } else {
-            text.insert_str(cursor_pos, text_to_insert);
+            text.replace_range(cursor_pos..selection_end, text_to_insert);
         }
 
         self.add_undo_item(UndoItem {
@@ -1971,7 +2275,7 @@ impl TextInput {
             text: inserted_text,
             cursor: real_cursor,
             anchor: real_anchor,
-            kind: UndoItemKind::TextInsert,
+            kind,
         });
 
         let cursor_pos = cursor_pos + text_to_insert.len();
@@ -2000,6 +2304,8 @@ impl TextInput {
         focus: i32,
     ) {
         let text = self.text();
+        // Consume external source changes before restoring selection and its viewport.
+        self.align_to_text(&text, self_rc);
         let safe_anchor = safe_byte_offset(anchor, &text);
         let safe_focus = safe_byte_offset(focus, &text);
 
@@ -2259,6 +2565,7 @@ impl TextInput {
     }
 
     fn add_undo_item(self: Pin<&Self>, item: UndoItem) {
+        self.redo_items.set(Default::default());
         let mut items = self.undo_items.take();
         // try to merge with the last item
         if let Some(last) = items.make_mut_slice().last_mut() {
@@ -2330,6 +2637,20 @@ impl TextInput {
                     self_rc,
                 );
             }
+            UndoItemKind::TextReplace(ref removed)
+            | UndoItemKind::SourceEdit { ref removed, .. } => {
+                let mut text: String = self.text().into();
+                text.replace_range(last.pos..last.pos + last.text.len(), removed);
+                self.set_text_internal(text.into());
+                self.anchor_position_byte_offset.set(last.anchor as i32);
+                self.set_cursor_position(
+                    last.cursor as i32,
+                    true,
+                    TextChangeNotify::TriggerCallbacks,
+                    window_adapter,
+                    self_rc,
+                );
+            }
         }
         self.undo_items.set(items);
 
@@ -2369,6 +2690,27 @@ impl TextInput {
                 self.anchor_position_byte_offset.set(last.anchor as i32);
                 self.set_cursor_position(
                     last.cursor as i32,
+                    true,
+                    TextChangeNotify::TriggerCallbacks,
+                    window_adapter,
+                    self_rc,
+                );
+            }
+            UndoItemKind::SourceEdit { ref removed, anchor_after, caret_after } => {
+                let mut text: String = self.text().into();
+                text.replace_range(last.pos..last.pos + removed.len(), &last.text);
+                self.set_text_internal(text.into());
+                self.anchor_position_byte_offset.set(anchor_after as i32);
+                self.set_cursor_position(caret_after as i32, true, TextChangeNotify::TriggerCallbacks, window_adapter, self_rc);
+            }
+            UndoItemKind::TextReplace(ref removed) => {
+                let mut text: String = self.text().into();
+                text.replace_range(last.pos..last.pos + removed.len(), &last.text);
+                self.set_text_internal(text.into());
+                let cursor = (last.pos + last.text.len()) as i32;
+                self.anchor_position_byte_offset.set(cursor);
+                self.set_cursor_position(
+                    cursor,
                     true,
                     TextChangeNotify::TriggerCallbacks,
                     window_adapter,
@@ -2468,6 +2810,21 @@ fn next_word_boundary(text: &str, last_cursor_pos: usize) -> usize {
     text.unicode_word_indices()
         .find(|(offset, slice)| *offset + slice.len() >= last_cursor_pos)
         .map_or(text.len(), |(offset, slice)| offset + slice.len())
+}
+
+#[cfg(feature = "ffi")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slint_textinput_apply_source_edit(
+    text_input: Pin<&TextInput>,
+    window_adapter: *const crate::window::ffi::WindowAdapterRcOpaque,
+    self_component: &vtable::VRc<crate::item_tree::ItemTreeVTable>, self_index: u32,
+    start: i32, end: i32, replacement: &SharedString, anchor: i32, caret: i32,
+) -> bool {
+    unsafe {
+        let window_adapter = &*(window_adapter as *const Rc<dyn WindowAdapter>);
+        let self_rc = ItemRc::new(self_component.clone(), self_index);
+        text_input.apply_source_edit(window_adapter, &self_rc, start, end, replacement.clone(), anchor, caret)
+    }
 }
 
 #[cfg(feature = "ffi")]

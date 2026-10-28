@@ -24,6 +24,17 @@
 macro_rules! for_each_enums {
     ($macro:ident) => {
         $macro! {
+            /// Experimental paint-only source marker shapes.
+            #[non_exhaustive]
+            pub enum TextInputMarkerKind {
+                /// A filled circular list marker.
+                Bullet,
+                /// An outlined box.
+                Checkbox,
+                /// An outlined box with a filled center.
+                CheckedCheckbox,
+            }
+
             /// This enum describes the different types of alignment of text along the horizontal axis of a `Text` or `StyledText` element.
             #[non_exhaustive]
             enum TextHorizontalAlignment {

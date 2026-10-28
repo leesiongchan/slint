@@ -763,6 +763,10 @@ impl Window {
                 WindowEventDispatchResult::Accepted
             }
             crate::platform::WindowEvent::Internal(event) => match event.into_inner() {
+                crate::platform::InternalEvent::CompositionStatusChanged { context_id, status } => {
+                    self.0.set_composition_status(context_id, status);
+                    WindowEventDispatchResult::Accepted
+                }
                 crate::platform::InternalEvent::Mouse(BackendMouseEvent::Exit) => {
                     // Teardown event, always accepted like `WindowEvent::PointerExited`.
                     self.0.process_mouse_input(MouseEvent::Exit);

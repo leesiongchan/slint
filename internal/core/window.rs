@@ -559,6 +559,8 @@ impl Drop for PopupWindow {
 #[pin_project::pin_project]
 struct WindowPinnedFields {
     #[pin]
+    composition_idle: Property<bool>,
+    #[pin]
     redraw_tracker: PropertyTracker<false, WindowRedrawTracker>,
     /// Gets dirty when the layout restrictions, or some other property of the windows change
     #[pin]
@@ -642,6 +644,7 @@ pub fn default_window_title() -> SharedString {
 
 /// Inner datastructure for the [`crate::api::Window`]
 pub struct WindowInner {
+    composition_context: Cell<u64>,
     window_adapter_weak: Weak<dyn WindowAdapter>,
     component: RefCell<ItemTreeWeak>,
     /// When the window is visible, keep a strong reference
@@ -689,6 +692,17 @@ impl Drop for WindowInner {
 }
 
 impl WindowInner {
+    pub(crate) fn set_composition_status(&self, context_id: u64, status: crate::input::CompositionStatus) {
+        if context_id < self.composition_context.get() { return; }
+        self.composition_context.set(context_id);
+        self.pinned_fields.as_ref().project_ref().composition_idle
+            .set(status == crate::input::CompositionStatus::Idle);
+    }
+
+    pub(crate) fn source_edits_allowed(&self) -> bool {
+        self.pinned_fields.as_ref().project_ref().composition_idle.get()
+    }
+
     /// Create a new instance of the window, given the window_adapter factory fn
     pub fn new(window_adapter_weak: Weak<dyn WindowAdapter>) -> Self {
         #![allow(unused_mut)]
@@ -710,12 +724,14 @@ impl WindowInner {
         }
 
         Self {
+            composition_context: Cell::new(0),
             window_adapter_weak,
             component: Default::default(),
             strong_component_ref: Default::default(),
             mouse_input_state: Default::default(),
             touch_state: Default::default(),
             pinned_fields: Box::pin(WindowPinnedFields {
+                composition_idle: Property::new(false),
                 redraw_tracker,
                 window_properties_tracker,
                 scale_factor: Property::new_named(1., "i_slint_core::Window::scale_factor"),

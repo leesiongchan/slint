@@ -1080,6 +1080,18 @@ impl core::fmt::Debug for Keys {
     }
 }
 
+/// Native composition permission, independent of the preedit string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompositionStatus {
+    /// No authoritative lifecycle has been received for this context.
+    #[default]
+    Unknown,
+    /// Native composition has explicitly ended or the context was initialized.
+    Idle,
+    /// A native composition session is in progress, including empty updates.
+    Active,
+}
+
 /// This enum defines the different kinds of key events that can happen.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 #[repr(u8)]

@@ -5534,6 +5534,20 @@ fn compile_builtin_function_call(
             }
             })
         }
+        BuiltinFunction::ApplySourceEdit => {
+            if let [llr::Expression::PropertyReference(pr), start, end, replacement, anchor, caret] = arguments {
+                let window = access_window_field(ctx);
+                let start = compile_expression(start, ctx);
+                let end = compile_expression(end, ctx);
+                let replacement = compile_expression(replacement, ctx);
+                let anchor = compile_expression(anchor, ctx);
+                let caret = compile_expression(caret, ctx);
+                item_owner(pr).then(|owner| {
+                    let (item, item_rc) = native_item_from_owner(pr, ctx, owner);
+                    format!("[&]() {{ auto source_replacement = {replacement}; return slint_textinput_apply_source_edit(&{item}, &{window}.handle(), &{item_rc}, static_cast<int>({start}), static_cast<int>({end}), &source_replacement, static_cast<int>({anchor}), static_cast<int>({caret})); }}()")
+                })
+            } else { panic!("internal error: invalid source edit arguments {arguments:?}") }
+        }
         BuiltinFunction::SetSelectionOffsets => {
             if let [llr::Expression::PropertyReference(pr), anchor_expr, focus_expr] = arguments {
                 let window = access_window_field(ctx);

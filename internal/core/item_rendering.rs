@@ -477,6 +477,9 @@ pub enum PlainOrStyledText {
 /// Trait for an item that represents an string towards the renderer
 #[allow(missing_docs)]
 pub trait RenderString: HasFont {
+    fn text_decorations(self: Pin<&Self>) -> alloc::vec::Vec<i_slint_common::styled_text::FormattedSpan> {
+        alloc::vec::Vec::new()
+    }
     fn text(self: Pin<&Self>) -> PlainOrStyledText;
     fn max_lines(self: Pin<&Self>) -> i32 {
         0

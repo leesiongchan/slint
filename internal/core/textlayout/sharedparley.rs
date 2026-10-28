@@ -66,6 +66,7 @@ pub use super::DEFAULT_FONT_SIZE;
 mod cache;
 mod draw;
 mod layout;
+mod markers;
 mod selection;
 mod shaping;
 #[cfg(test)]
@@ -104,6 +105,8 @@ fn with_text_layout<R>(
     f: impl FnOnce(&Layout) -> R,
 ) -> Option<R> {
     let ctx = crate::window::WindowInner::from_pub(window).try_context()?;
+    // Bindings can re-enter measurement; evaluate before borrowing the font context.
+    let _ = text.text_decorations();
     let mut font_ctx = ctx.font_context().borrow_mut();
 
     let text_wrap = layout_builder.text_wrap;
@@ -221,6 +224,7 @@ pub fn draw_text(
                     // `Text` has no selection today; the machinery is shared so wiring one up
                     // later is a matter of passing spans here.
                     None,
+                    &[],
                 );
             }
 
@@ -314,6 +318,7 @@ pub fn draw_text_input(
     }
 
     let visual_representation = text_input.visual_representation();
+    let marker_data = markers::prepare(text_input);
 
     let text_color = visual_representation.text_color.color();
     let Some(platform_fill_brush) =
@@ -335,13 +340,8 @@ pub fn draw_text_input(
 
     let window_adapter = item_renderer.window().window_adapter();
 
-    // The visual text shapes through the shared cache entry like any other text: a selection
-    // doesn't make the entry unshareable, because it is applied when drawing, by clipping the
-    // runs it cuts across, and never reaches shaping. Cluster ranges and advances are identical
-    // with and without one, so a selected `TextInput` hits the same entry as an unselected one --
-    // which is what keeps dragging a selection, or composing with an IME, from re-shaping the
-    // document on every event. A password field shapes a substituted text, but the substitution
-    // is the same everywhere, so it is cacheable too.
+    // Selection colors stay paint-only. Compact prefixes additionally track logical endpoints
+    // to reveal raw source without changing source offsets.
     let _ = with_text_layout(
         Some(cache),
         Some(item_rc),
@@ -391,13 +391,18 @@ pub fn draw_text_input(
                     })
                     .flatten();
 
+                let painted_markers = markers::resolve(layout, &marker_data, layout_builder.pixel_size, item_renderer.scale_factor().get(), draw::visible_band(item_renderer), |color| item_renderer.platform_brush_for_color(color).is_some());
                 layout.draw(
                     item_renderer,
                     platform_fill_brush,
                     None,
                     text_color,
                     selection.as_ref(),
+                    &painted_markers,
                 );
+                for marker in &painted_markers {
+                    marker.draw(item_renderer);
+                }
 
                 if let Some(cursor_pos) = visual_representation.cursor_position {
                     let cursor_rect = layout.cursor_rect_for_byte_offset(
@@ -457,6 +462,7 @@ fn text_size_impl(
     let _ = text_item.stroke();
     let _ = text_item.link_color();
     let _ = text_item.text();
+    let _ = text_item.text_decorations();
 
     let window_adapter = window_adapter?;
 
@@ -513,6 +519,7 @@ fn text_content_widths_impl(
     // entry's dependency tracker.
     let _ = text_item.font_request(item_rc);
     let _ = text_item.text();
+    let _ = text_item.text_decorations();
 
     let ctx = ctx?;
     let mut font_ctx = ctx.font_context().borrow_mut();
@@ -524,7 +531,7 @@ fn text_content_widths_impl(
             shaping::content_widths_builder(text_item.font_request(item_rc), scale_factor);
 
         let paragraphs_without_linebreaks =
-            create_text_paragraphs(&layout_builder, font_ctx, text_item.text(), Color::default());
+            create_text_paragraphs(&layout_builder, font_ctx, text_item.text(), Color::default(), &text_item.text_decorations());
 
         // No line breaking needed: parley derives the content widths from the break
         // opportunities. Paragraphs stack vertically, so both widths are the widest.
@@ -756,6 +763,7 @@ fn text_input_cursor_rect_for_byte_offset_impl(
 #[allow(dead_code)]
 pub struct TextInputLayout<'a> {
     layout: &'a Layout,
+    font_size: LogicalLength,
     /// The string the paragraphs were shaped from, which [`TextInputParagraph::range`] indexes.
     text: &'a str,
 }
@@ -850,7 +858,7 @@ fn with_text_input_layout_impl<R>(
         &layout_builder,
         LayoutOptions::new_from_textinput(text_input, Some(width), Some(height)),
         window_adapter.window(),
-        |layout| f(TextInputLayout { layout, text: &text }),
+        |layout| f(TextInputLayout { layout, text: &text, font_size: layout_builder.pixel_size }),
     )
 }
 
@@ -858,3 +866,54 @@ fn with_text_input_layout_impl<R>(
 mod accessibility;
 #[cfg(feature = "accessibility-text")]
 pub use accessibility::CachedTextInputAccessibilityState;
+
+
+/// Resolve a visible checkbox through exactly the same source/layout validation as painting.
+pub(crate) fn text_input_marker_at_position(
+    renderer: &(impl RendererSealed + ?Sized), input: Pin<&crate::items::TextInput>,
+    item: &crate::item_tree::ItemRc, mut position: LogicalPoint,
+) -> Option<crate::items::TextInputMarkerHit> {
+    let local_position = position;
+    let size = item.geometry().size;
+    if !LogicalRect::new(LogicalPoint::default(),size).contains(position) { return None; }
+    let scale = renderer.scale_factor()?.get();
+    if !scale.is_finite() || scale <= 0.0 { return None; }
+    if !matches!(input.color(), crate::Brush::SolidColor(c) if c.alpha() != 0) { return None; }
+    let mut current = item.clone();
+    while let Some(parent) = current.parent_item(crate::item_tree::ParentItemTraversalMode::StopAtPopups) {
+        position += current.geometry().origin.to_vector();
+        if renderer.supports_transformations() {
+            if let Some(transform) = parent.children_transform() {
+                position = transform.transform_point(position.cast()).cast();
+            }
+        }
+        let geometry = parent.geometry();
+        if let Some(clip) = parent.downcast::<crate::items::Clip>() {
+            let clip = clip.as_pin_ref();
+            if clip.clip() {
+                let (rect,radii) = crate::item_rendering::clip_content_box(geometry.size,clip.logical_border_radius(),clip.border_width());
+                if !markers::rounded_contains(rect,radii,position) { return None; }
+            }
+        }
+        if parent.downcast::<crate::items::Flickable>().is_some()
+            && !LogicalRect::new(LogicalPoint::default(),geometry.size).contains(position) { return None; }
+        if let Some(opacity) = parent.downcast::<crate::items::Opacity>() {
+            let value=opacity.as_pin_ref().opacity();
+            if !value.is_finite() || value <= 0.0 { return None; }
+        }
+        current = parent;
+    }
+    let markers = markers::prepare(input);
+    let mut hit = with_text_input_layout(renderer,input,item,size,|layout| {
+        let resolved = markers::resolve(layout.layout,&markers,layout.font_size,scale,
+            PhysicalLength::new(0.0)..PhysicalLength::new(size.height*scale),|c| c.alpha()!=0);
+        markers::hit(resolved,local_position,scale)
+    })??;
+    let preedit = input.preedit_text();
+    let cursor = input.cursor_position_byte_offset().max(0) as usize;
+    if !preedit.is_empty() && cursor < hit.source_range.start {
+        hit.source_range.start = hit.source_range.start.checked_sub(preedit.len())?;
+        hit.source_range.end = hit.source_range.end.checked_sub(preedit.len())?;
+    }
+    Some(hit)
+}

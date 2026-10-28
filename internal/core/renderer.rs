@@ -259,6 +259,16 @@ pub trait RendererSealed {
         )
     }
 
+    /// The visible source-checkbox shape at this item-local position, if supported.
+    fn text_input_marker_at_position(
+        &self, input: Pin<&crate::items::TextInput>, item: &ItemRc, position: LogicalPoint,
+    ) -> Option<crate::items::TextInputMarkerHit> {
+        #[cfg(feature = "shared-parley")]
+        { crate::textlayout::sharedparley::text_input_marker_at_position(self,input,item,position) }
+        #[cfg(not(feature = "shared-parley"))]
+        { let _ = (input,item,position); None }
+    }
+
     /// Whether this renderer lays `text_input`'s text out through parley.
     #[cfg(feature = "shared-parley")]
     fn text_input_has_parley_layout(

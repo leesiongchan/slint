@@ -155,10 +155,7 @@ impl LayoutWithoutLineBreaksBuilder {
         builder
     }
 
-    /// Note that the selection is deliberately absent here: it is a rendering concern, not a
-    /// styling one, and baking it into the layout both makes the layout uncacheable across
-    /// selection changes and makes sub-glyph selection boundaries unrepresentable. See
-    /// [`SelectionSpan`].
+    /// Selection geometry is painted separately; only compact-prefix reveal affects shaping.
     pub(super) fn build(
         &self,
         font_context: &mut parley::FontContext,
@@ -168,74 +165,157 @@ impl LayoutWithoutLineBreaksBuilder {
     ) -> parley::Layout<Brush> {
         use i_slint_common::styled_text::Style;
 
+        let formatting: Vec<_> = formatting.into_iter().filter(|s| !s.range.is_empty()).collect();
         LAYOUT_CONTEXT.with_borrow_mut(|layout_ctx| {
-            let mut builder = self.ranged_builder(layout_ctx, font_context, text);
-
-            // filter empty ranges otherwise parley will panic on assert
-            for span in formatting.into_iter().filter(|s| !s.range.is_empty()) {
-                match span.style {
-                    Style::Emphasis => {
-                        builder.push(
-                            parley::StyleProperty::FontStyle(parley::style::FontStyle::Italic),
-                            span.range,
-                        );
-                    }
-                    Style::Strikethrough => {
-                        builder.push(parley::StyleProperty::Strikethrough(true), span.range);
-                    }
-                    Style::Strong => {
-                        builder.push(
-                            parley::StyleProperty::FontWeight(parley::style::FontWeight::BOLD),
-                            span.range,
-                        );
-                    }
-                    Style::Code => {
-                        builder.push(
-                            parley::StyleProperty::FontFamily(parley::style::FontFamily::Single(
-                                parley::style::FontFamilyName::Generic(
-                                    parley::style::GenericFamily::Monospace,
+            let build = |layout_ctx: &mut parley::LayoutContext<Brush>,
+                         font_context: &mut parley::FontContext,
+                         compact: &[(Range<usize>, f32)]| {
+                let mut builder = self.ranged_builder(layout_ctx, font_context, text);
+                for span in formatting.iter().cloned() {
+                    match span.style {
+                        Style::Emphasis => {
+                            builder.push(
+                                parley::StyleProperty::FontStyle(parley::style::FontStyle::Italic),
+                                span.range,
+                            );
+                        }
+                        Style::Strikethrough => {
+                            builder.push(parley::StyleProperty::Strikethrough(true), span.range);
+                        }
+                        Style::Strong => {
+                            builder.push(
+                                parley::StyleProperty::FontWeight(parley::style::FontWeight::BOLD),
+                                span.range,
+                            );
+                        }
+                        Style::Code | Style::SourceCode => {
+                            builder.push(
+                                parley::StyleProperty::FontFamily(
+                                    parley::style::FontFamily::Single(
+                                        parley::style::FontFamilyName::Generic(
+                                            parley::style::GenericFamily::Monospace,
+                                        ),
+                                    ),
                                 ),
-                            )),
-                            span.range.clone(),
-                        );
-                        // Inline `code` reads as slightly smaller text on top of a
-                        // translucent capsule (drawn separately in `TextParagraph::draw`),
-                        // matching the convention used by common markdown renderers.
-                        builder.push(
-                            parley::StyleProperty::FontSize(
-                                self.pixel_size.get() * INLINE_CODE_FONT_SCALE,
-                            ),
-                            span.range,
-                        );
-                    }
-                    Style::Underline => {
-                        builder.push(parley::StyleProperty::Underline(true), span.range);
-                    }
-                    Style::Link => {
-                        builder.push(parley::StyleProperty::Underline(true), span.range.clone());
-                        builder.push(
-                            parley::StyleProperty::Brush(Brush {
-                                override_fill_color: None,
-                                stroke: self.stroke,
-                                link_color,
-                            }),
-                            span.range,
-                        );
-                    }
-                    Style::Color(color) => {
-                        builder.push(
-                            parley::StyleProperty::Brush(Brush {
-                                override_fill_color: Some(crate::Color::from_argb_encoded(color)),
-                                stroke: self.stroke,
-                                link_color: None,
-                            }),
-                            span.range,
-                        );
+                                span.range.clone(),
+                            );
+                            // Inline `code` reads as slightly smaller text on top of a
+                            // translucent capsule (drawn separately in `TextParagraph::draw`),
+                            // matching the convention used by common markdown renderers.
+                            builder.push(
+                                parley::StyleProperty::FontSize(
+                                    self.pixel_size.get()
+                                        * if matches!(span.style, Style::SourceCode) {
+                                            1.0
+                                        } else {
+                                            INLINE_CODE_FONT_SCALE
+                                        },
+                                ),
+                                span.range,
+                            );
+                        }
+                        Style::Underline => {
+                            builder.push(parley::StyleProperty::Underline(true), span.range);
+                        }
+                        Style::Link => {
+                            builder
+                                .push(parley::StyleProperty::Underline(true), span.range.clone());
+                            builder.push(
+                                parley::StyleProperty::Brush(Brush {
+                                    override_fill_color: None,
+                                    stroke: self.stroke,
+                                    link_color,
+                                }),
+                                span.range,
+                            );
+                        }
+                        Style::CompactMarker { .. } => {}
+                        Style::Color(color) => {
+                            builder.push(
+                                parley::StyleProperty::Brush(Brush {
+                                    override_fill_color: Some(crate::Color::from_argb_encoded(
+                                        color,
+                                    )),
+                                    stroke: self.stroke,
+                                    link_color: None,
+                                }),
+                                span.range,
+                            );
+                        }
                     }
                 }
-            }
 
-            builder.build(text)
+                for (range, spacing) in compact {
+                    builder.push(parley::StyleProperty::LetterSpacing(*spacing), range.clone());
+                }
+                builder.build(text)
+            };
+            let mut normal = build(layout_ctx, font_context, &[]);
+            if !formatting.iter().any(|span| matches!(span.style, Style::CompactMarker { .. })) {
+                return normal;
+            }
+            normal.break_all_lines(None);
+            // RTL and narrow prefixes retain raw advances, matching the painting fallback.
+            if normal.lines().flat_map(|line| line.runs()).any(|run| run.is_rtl()) {
+                return normal;
+            }
+            let scale = self.scale_factor.get();
+            let target = self.pixel_size.get() * scale * 2.0;
+            let base_spacing = self
+                .font_request
+                .as_ref()
+                .and_then(|font| font.letter_spacing)
+                .map_or(0.0, |spacing| spacing.get());
+            let mut compact = Vec::new();
+            for span in &formatting {
+                let Style::CompactMarker { max_width } = span.style else {
+                    continue;
+                };
+                let start = parley::editing::Cursor::from_byte_index(
+                    &normal,
+                    span.range.start,
+                    Default::default(),
+                );
+                let end = parley::editing::Cursor::from_byte_index(
+                    &normal,
+                    span.range.end,
+                    Default::default(),
+                );
+                let a = start.geometry(&normal, 0.0);
+                let b = end.geometry(&normal, 0.0);
+                let advance = (b.x0 - a.x0) as f32;
+                if start.index() != span.range.start
+                    || end.index() != span.range.end
+                    || !advance.is_finite()
+                    || advance <= 0.0
+                    || a.x0 as f32 + target > max_width * scale
+                {
+                    continue;
+                }
+                let delta = (target - advance) / span.range.len() as f32;
+                // Keep every source cluster's advance positive, including variable-width fonts.
+                let safe = span.range.clone().all(|offset| {
+                    let left = parley::editing::Cursor::from_byte_index(
+                        &normal,
+                        offset,
+                        Default::default(),
+                    );
+                    let right = parley::editing::Cursor::from_byte_index(
+                        &normal,
+                        offset + 1,
+                        Default::default(),
+                    );
+                    left.index() == offset
+                        && right.index() == offset + 1
+                        && (right.geometry(&normal, 0.0).x0 - left.geometry(&normal, 0.0).x0) as f32
+                            + delta
+                            > 0.0
+                });
+                if safe {
+                    compact.push((span.range.clone(), base_spacing + delta / scale));
+                }
+            }
+            if compact.is_empty() { normal } else { build(layout_ctx, font_context, &compact) }
         })
     }
 }
@@ -275,6 +355,7 @@ pub(super) fn create_text_paragraphs(
     font_context: &mut parley::FontContext,
     text: PlainOrStyledText,
     link_color: Color,
+    decorations: &[i_slint_common::styled_text::FormattedSpan],
 ) -> Vec<TextParagraph> {
     let paragraph_from_text =
         |font_context: &mut parley::FontContext,
@@ -284,7 +365,7 @@ pub(super) fn create_text_paragraphs(
          links: Vec<(std::ops::Range<usize>, std::string::String)>| {
             let code_ranges: alloc::vec::Vec<Range<usize>> = formatting
                 .iter()
-                .filter(|s| matches!(s.style, i_slint_common::styled_text::Style::Code))
+                .filter(|s| matches!(s.style, i_slint_common::styled_text::Style::Code | i_slint_common::styled_text::Style::SourceCode))
                 .map(|s| s.range.clone())
                 .collect();
 
@@ -301,8 +382,16 @@ pub(super) fn create_text_paragraphs(
                 paragraphs.push(paragraph_from_text(
                     font_context,
                     &text[range.clone()],
-                    range,
-                    Default::default(),
+                    range.clone(),
+                    decorations[decorations.partition_point(|span| span.range.end <= range.start)..]
+                        .iter()
+                        .take_while(|span| span.range.start < range.end)
+                        .map(|span| i_slint_common::styled_text::FormattedSpan {
+                            range: span.range.start.max(range.start) - range.start
+                                ..span.range.end.min(range.end) - range.start,
+                            style: span.style.clone(),
+                        })
+                        .collect(),
                     Default::default(),
                 ));
             }
@@ -386,7 +475,7 @@ pub(super) fn shape_paragraphs(
     font_context: &mut parley::FontContext,
 ) -> Vec<TextParagraph> {
     let builder = shaping_builder(text, item_rc, text_wrap, scale_factor);
-    create_text_paragraphs(&builder, font_context, text.text(), text.link_color())
+    create_text_paragraphs(&builder, font_context, text.text(), text.link_color(), &text.text_decorations())
 }
 
 pub(super) struct TextParagraph {
